@@ -148,7 +148,11 @@ function main() {
             syncDelay: CONFIG.SYNC_DELAY
         },
         syncTimeout: null,
-        ownerOnlyMode: false
+        ownerOnlyMode: false,
+        lastHostState: null,
+        lastPlayStateChange: 0,
+        heartbeatInterval: null,
+        predictInterval: null
     };
 
     let uiCallback = null;
@@ -204,7 +208,7 @@ function main() {
                 name: d.item.name || "",
                 position: Spicetify.Player.getProgress(),
                 isPlaying: !!isPlayingNow(),
-                timestamp: Date.now()
+                sentAt: Date.now()
             };
         } catch { return null; }
     }
@@ -226,7 +230,7 @@ function main() {
             log('Applying host state:', s);
             
             // Calculate elapsed time since host sent this state
-            const elapsed = Math.max(0, Math.min(Date.now() - s.timestamp, 5000));
+            const elapsed = Math.max(0, Math.min(Date.now() - s.sentAt, 5000));
             const target = Math.floor((s.position || 0) + (s.isPlaying ? elapsed : 0));
 
             const cur = Spicetify.Player.data?.item;
@@ -236,6 +240,7 @@ function main() {
                 await new Promise(r => setTimeout(r, 600));
                 if (s.isPlaying && !isPlayingNow()) Spicetify.Player.play();
                 if (!s.isPlaying && isPlayingNow()) Spicetify.Player.pause();
+                session.lastPlayStateChange = Date.now();
                 return;
             }
             
@@ -244,6 +249,7 @@ function main() {
             setTimeout(() => {
                 if (s.isPlaying && !isPlayingNow()) Spicetify.Player.play();
                 if (!s.isPlaying && isPlayingNow()) Spicetify.Player.pause();
+                session.lastPlayStateChange = Date.now();
             }, 200);
         } catch(e) {
             err('Error applying host state:', e);
@@ -252,6 +258,89 @@ function main() {
 
     function canControlPlayback() {
         return session.amHost || !session.permissions.hostOnly || !session.ownerOnlyMode;
+    }
+
+    // Heartbeat - host broadcasts state periodically
+    function startHeartbeat() {
+        if (session.heartbeatInterval) clearInterval(session.heartbeatInterval);
+        session.heartbeatInterval = setInterval(() => {
+            if (session.amHost && session.active) {
+                const state = getState();
+                if (state) {
+                    broadcastMessage({
+                        type: 'state',
+                        state: state,
+                        permissions: session.permissions
+                    });
+                }
+            }
+        }, 2000); // Every 2 seconds
+    }
+
+    function stopHeartbeat() {
+        if (session.heartbeatInterval) {
+            clearInterval(session.heartbeatInterval);
+            session.heartbeatInterval = null;
+        }
+    }
+
+    // Predict loop - guests check and correct play/pause state
+    function startPredictLoop() {
+        if (session.predictInterval) clearInterval(session.predictInterval);
+        session.predictInterval = setInterval(() => {
+            if (!session.active || session.amHost) return;
+            
+            const s = session.lastHostState;
+            if (!s?.uri) return;
+
+            // Grace period after play/pause transition
+            const GRACE_AFTER_PAUSE_MS = 1500;
+            if (Date.now() - session.lastPlayStateChange < GRACE_AFTER_PAUSE_MS) {
+                return;
+            }
+
+            try {
+                const cur = Spicetify.Player.data?.item;
+                if (!cur || cur.uri !== s.uri) return;
+
+                // Check play/pause state
+                if (s.isPlaying && !isPlayingNow()) {
+                    log('Predict loop: host is playing, we are paused - resuming');
+                    Spicetify.Player.play();
+                    session.lastPlayStateChange = Date.now();
+                    return;
+                }
+                if (!s.isPlaying && isPlayingNow()) {
+                    log('Predict loop: host is paused, we are playing - pausing');
+                    Spicetify.Player.pause();
+                    session.lastPlayStateChange = Date.now();
+                    return;
+                }
+
+                // If host is playing, check position drift
+                if (s.isPlaying) {
+                    const elapsed = Math.max(0, Date.now() - s.sentAt);
+                    const predictedPos = (s.position || 0) + elapsed;
+                    const currentPos = Spicetify.Player.getProgress();
+                    const drift = Math.abs(predictedPos - currentPos);
+                    
+                    // Correct if drift is significant (> 500ms)
+                    if (drift > 500) {
+                        log('Predict loop: drift detected, correcting position');
+                        Spicetify.Player.seek(Math.floor(predictedPos));
+                    }
+                }
+            } catch(e) {
+                err('Predict loop error:', e);
+            }
+        }, 500); // Check every 500ms
+    }
+
+    function stopPredictLoop() {
+        if (session.predictInterval) {
+            clearInterval(session.predictInterval);
+            session.predictInterval = null;
+        }
     }
 
     function showOwnerOnlyNotification() {
@@ -398,9 +487,11 @@ function main() {
                 sendStateToPeer(conn.peer);
                 // Also send a joined message to other peers
                 broadcastMessage({ type: 'joined', user: session.myName });
+                startHeartbeat();
             } else {
                 conn.send({ type: 'requestState' });
                 conn.send({ type: 'joined', user: session.myName });
+                startPredictLoop();
             }
 
             Spicetify.showNotification('Connected to peer!');
@@ -445,34 +536,38 @@ function main() {
 
         switch (message.type) {
             case 'play':
-                if (canControlPlayback() || message.fromHost) {
-                    if (session.syncTimeout) clearTimeout(session.syncTimeout);
-                    session.syncTimeout = setTimeout(() => {
-                        Spicetify.Player.resume();
-                    }, session.permissions.syncDelay);
-                } else if (!session.amHost && session.ownerOnlyMode) {
+                if (session.ownerOnlyMode && !session.amHost && !message.fromHost) {
                     showOwnerOnlyNotification();
+                    return;
                 }
+                if (session.syncTimeout) clearTimeout(session.syncTimeout);
+                session.syncTimeout = setTimeout(() => {
+                    Spicetify.Player.resume();
+                    session.lastPlayStateChange = Date.now();
+                }, session.permissions.syncDelay);
                 break;
             case 'pause':
-                if (canControlPlayback() || message.fromHost) {
-                    if (session.syncTimeout) clearTimeout(session.syncTimeout);
-                    Spicetify.Player.pause();
-                } else if (!session.amHost && session.ownerOnlyMode) {
+                if (session.ownerOnlyMode && !session.amHost && !message.fromHost) {
                     showOwnerOnlyNotification();
+                    return;
                 }
+                if (session.syncTimeout) clearTimeout(session.syncTimeout);
+                Spicetify.Player.pause();
+                session.lastPlayStateChange = Date.now();
                 break;
             case 'seek':
-                if (canControlPlayback() || message.fromHost) {
-                    Spicetify.Player.seek(message.position);
-                } else if (!session.amHost && session.ownerOnlyMode) {
+                if (session.ownerOnlyMode && !session.amHost && !message.fromHost) {
                     showOwnerOnlyNotification();
+                    return;
                 }
+                Spicetify.Player.seek(message.position);
                 break;
             case 'track':
-                if (canControlPlayback() || message.fromHost) {
-                    applyHostState({ uri: message.uri, position: message.position, isPlaying: message.isPlaying, timestamp: message.timestamp });
+                if (session.ownerOnlyMode && !session.amHost && !message.fromHost) {
+                    showOwnerOnlyNotification();
+                    return;
                 }
+                applyHostState({ uri: message.uri, position: message.position, isPlaying: message.isPlaying, sentAt: message.timestamp });
                 break;
             case 'requestState':
                 if (session.amHost) {
@@ -484,6 +579,7 @@ function main() {
                     if (message.permissions) {
                         session.permissions = message.permissions;
                     }
+                    session.lastHostState = message.state;
                     applyHostState(message.state);
                 }
                 break;
@@ -513,49 +609,61 @@ function main() {
     function setupPlayerListeners() {
         Spicetify.Player.addEventListener('play', () => {
             log('Play event triggered');
-            if (session.active) {
-                broadcastMessage({
-                    type: 'play',
-                    fromHost: session.amHost,
-                    timestamp: Date.now()
-                });
+            session.lastPlayStateChange = Date.now();
+            if (session.active && session.amHost) {
+                // Host broadcasts full state on play
+                const state = getState();
+                if (state) {
+                    broadcastMessage({
+                        type: 'state',
+                        state: state,
+                        permissions: session.permissions
+                    });
+                }
             }
         });
 
         Spicetify.Player.addEventListener('pause', () => {
             log('Pause event triggered');
-            if (session.active) {
-                broadcastMessage({
-                    type: 'pause',
-                    fromHost: session.amHost
-                });
+            session.lastPlayStateChange = Date.now();
+            if (session.active && session.amHost) {
+                // Host broadcasts full state on pause
+                const state = getState();
+                if (state) {
+                    broadcastMessage({
+                        type: 'state',
+                        state: state,
+                        permissions: session.permissions
+                    });
+                }
             }
         });
 
         Spicetify.Player.addEventListener('seek', (e) => {
             log('Seek event triggered:', e.data);
-            if (session.active) {
-                broadcastMessage({
-                    type: 'seek',
-                    position: e.data,
-                    fromHost: session.amHost,
-                    timestamp: Date.now()
-                });
+            if (session.active && session.amHost) {
+                // Host broadcasts full state on seek
+                const state = getState();
+                if (state) {
+                    broadcastMessage({
+                        type: 'state',
+                        state: state,
+                        permissions: session.permissions
+                    });
+                }
             }
         });
 
         Spicetify.Player.addEventListener('songchange', () => {
             log('Songchange event triggered');
-            if (session.active) {
-                const playerState = getState();
-                if (playerState) {
+            if (session.active && session.amHost) {
+                // Host broadcasts full state on track change
+                const state = getState();
+                if (state) {
                     broadcastMessage({
-                        type: 'track',
-                        uri: playerState.uri,
-                        position: playerState.position,
-                        isPlaying: playerState.isPlaying,
-                        fromHost: session.amHost,
-                        timestamp: Date.now()
+                        type: 'state',
+                        state: state,
+                        permissions: session.permissions
                     });
                 }
             }
@@ -563,6 +671,9 @@ function main() {
     }
 
     function cleanup() {
+        stopHeartbeat();
+        stopPredictLoop();
+        
         if (session.syncTimeout) {
             clearTimeout(session.syncTimeout);
             session.syncTimeout = null;
@@ -592,6 +703,8 @@ function main() {
         session.code = "";
         session.myPeerId = null;
         session.members = [];
+        session.lastHostState = null;
+        session.lastPlayStateChange = 0;
         notifyUI();
     }
 
