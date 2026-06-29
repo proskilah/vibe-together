@@ -1,0 +1,25 @@
+{
+  "name": "VibeTogether",
+  "description": "Synchronized music listening with friends using P2P technology. Share your music in real-time with play/pause sync and owner-only mode.",
+  "version": "1.0.0",
+  "authors": [
+    {
+      "name": "VibeCodeadas",
+      "url": "https://github.com/Proskilah"
+    }
+  ],
+  "repository": "https://github.com/Proskilah/vibe-together",
+  "main": "vibeTogether.js",
+  "icon": "https://raw.githubusercontent.com/Proskilah/vibe-together/main/icon.png",
+  "readme": "README.md",
+  "license": "MIT",
+  "tags": [
+    "sync",
+    "p2p",
+    "music",
+    "friends",
+    "collaboration"
+  ],
+  "target": "Spicetify",
+  "type": "extension"
+}
