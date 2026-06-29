@@ -127,7 +127,7 @@ function main() {
     // Configuration
     const CONFIG = {
         SYNC_DELAY: 500,
-        MAX_PEERS: 4,
+        MAX_PEERS: 20,
         OWNER_ONLY_MODE: false
     };
 
@@ -152,7 +152,11 @@ function main() {
         lastHostState: null,
         lastPlayStateChange: 0,
         heartbeatInterval: null,
-        predictInterval: null
+        predictInterval: null,
+        clockOffset: 0, // Clock sync offset (guests only)
+        pingMap: {}, // For clock sync
+        timesyncInProgress: false,
+        timesyncSamples: []
     };
 
     let uiCallback = null;
@@ -199,6 +203,9 @@ function main() {
         return false;
     }
 
+    // hostNow(): current time in the host's clock frame
+    function hostNow() { return Date.now() + session.clockOffset; }
+
     function getState() {
         try {
             const d = Spicetify.Player.data;
@@ -229,8 +236,8 @@ function main() {
         try {
             log('Applying host state:', s);
             
-            // Calculate elapsed time since host sent this state
-            const elapsed = Math.max(0, Math.min(Date.now() - s.sentAt, 5000));
+            // Calculate elapsed time since host sent this state using clock sync
+            const elapsed = Math.max(0, Math.min(hostNow() - s.sentAt, 5000));
             const target = Math.floor((s.position || 0) + (s.isPlaying ? elapsed : 0));
 
             const cur = Spicetify.Player.data?.item;
@@ -284,7 +291,7 @@ function main() {
         }
     }
 
-    // Predict loop - guests check and correct play/pause state
+    // Predict loop - guests check and correct play/pause state (from CoListen)
     function startPredictLoop() {
         if (session.predictInterval) clearInterval(session.predictInterval);
         session.predictInterval = setInterval(() => {
@@ -316,24 +323,78 @@ function main() {
                     session.lastPlayStateChange = Date.now();
                     return;
                 }
+                if (!s.isPlaying) return;
 
-                // If host is playing, check position drift
-                if (s.isPlaying) {
-                    const elapsed = Math.max(0, Date.now() - s.sentAt);
-                    const predictedPos = (s.position || 0) + elapsed;
-                    const currentPos = Spicetify.Player.getProgress();
-                    const drift = Math.abs(predictedPos - currentPos);
-                    
-                    // Correct if drift is significant (> 500ms)
-                    if (drift > 500) {
-                        log('Predict loop: drift detected, correcting position');
-                        Spicetify.Player.seek(Math.floor(predictedPos));
-                    }
+                // If host is playing, check position drift using clock sync
+                const expected = predictedHostPosition(s);
+                const actual = Spicetify.Player.getProgress();
+                const drift = actual - expected;
+
+                if (Math.abs(drift) > 500) {
+                    log(`drift ${drift}ms > threshold â†’ correcting`);
+                    Spicetify.Player.seek(Math.floor(expected));
                 }
             } catch(e) {
                 err('Predict loop error:', e);
             }
         }, 500); // Check every 500ms
+    }
+
+    // Predict host position using clock sync (from CoListen)
+    function predictedHostPosition(s) {
+        if (!s) return 0;
+        const elapsed = Math.max(0, hostNow() - s.sentAt);
+        return (s.position || 0) + (s.isPlaying ? elapsed : 0);
+    }
+
+    // Clock sync (Cristian's algorithm) from CoListen
+    function runTimesync() {
+        if (session.amHost || !session.active || session.timesyncInProgress) return;
+        session.timesyncInProgress = true;
+        session.timesyncSamples = [];
+
+        let sampleIdx = 0;
+        const TIMESYNC_SAMPLES = 5;
+        const TIMESYNC_GAP_MS = 100;
+
+        function sendSample() {
+            if (sampleIdx >= TIMESYNC_SAMPLES) { finishTimesync(); return; }
+            sampleIdx++;
+            const t0 = Date.now();
+            const id = "ts_" + t0 + "_" + Math.random().toString(36).slice(2, 6);
+            session.pingMap[id] = (t1) => {
+                const t3 = Date.now();
+                const rtt = t3 - t0;
+                const offset = t1 - (t0 + rtt / 2);
+                session.timesyncSamples.push({ rtt, offset });
+            };
+            broadcastMessage({ type: "ts_req", id, t0 });
+            setTimeout(sendSample, TIMESYNC_GAP_MS);
+        }
+
+        function finishTimesync() {
+            session.timesyncInProgress = false;
+            if (session.timesyncSamples.length === 0) return;
+            session.timesyncSamples.sort((a, b) => a.rtt - b.rtt);
+            const best = session.timesyncSamples[0];
+            session.clockOffset = Math.round(best.offset);
+            log(`clock sync: offset=${session.clockOffset}ms, rtt=${best.rtt}ms (${session.timesyncSamples.length} samples)`);
+        }
+
+        sendSample();
+    }
+
+    function startPeriodicTimesync() {
+        if (session.timesyncInterval) clearInterval(session.timesyncInterval);
+        runTimesync();
+        session.timesyncInterval = setInterval(runTimesync, 30000); // Every 30 seconds
+    }
+
+    function stopPeriodicTimesync() {
+        if (session.timesyncInterval) {
+            clearInterval(session.timesyncInterval);
+            session.timesyncInterval = null;
+        }
     }
 
     function stopPredictLoop() {
@@ -492,6 +553,7 @@ function main() {
                 conn.send({ type: 'requestState' });
                 conn.send({ type: 'joined', user: session.myName });
                 startPredictLoop();
+                startPeriodicTimesync(); // Start clock sync
             }
 
             Spicetify.showNotification('Connected to peer!');
@@ -533,6 +595,17 @@ function main() {
 
     function handlePeerMessage(peerId, message) {
         log(`Message from ${peerId}:`, message.type);
+
+        // Time-sync handshake (from CoListen)
+        if (message.type === "ts_req" && session.amHost) {
+            broadcastMessage({ type: "ts_resp", id: message.id, t0: message.t0, t1: Date.now() });
+            return;
+        }
+        if (message.type === "ts_resp") {
+            const cb = session.pingMap[message.id];
+            if (cb) { cb(message.t1); delete session.pingMap[message.id]; }
+            return;
+        }
 
         switch (message.type) {
             case 'play':
@@ -673,6 +746,7 @@ function main() {
     function cleanup() {
         stopHeartbeat();
         stopPredictLoop();
+        stopPeriodicTimesync();
         
         if (session.syncTimeout) {
             clearTimeout(session.syncTimeout);
@@ -705,6 +779,10 @@ function main() {
         session.members = [];
         session.lastHostState = null;
         session.lastPlayStateChange = 0;
+        session.clockOffset = 0;
+        session.pingMap = {};
+        session.timesyncInProgress = false;
+        session.timesyncSamples = [];
         notifyUI();
     }
 
